@@ -2,8 +2,8 @@
 // 3 Models: 1. JS Free Library (fallback) 2. Groq (chat + analyze) 3. HF (image gen)
 // Frontend only sends request to /api/chat, no AI in frontend
 
-const GROQ_API_KEY = "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"; // starts with gsk_
-const HF_TOKEN = "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"; // starts with hf_
+const GROQ_API_KEY = "PASTE_YOUR_GROQ_KEY_HERE";
+const HF_TOKEN = "PASTE_YOUR_HF_TOKEN_HERE";
 
 // ===== BIG GOLVIRAL RULE =====
 const GOLVIRAL_RULE = `
