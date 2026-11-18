@@ -1,9 +1,9 @@
 // GolViral AI - Backend Only - api/chat.js
-// 3 Models: 1. JS Free Library (fallback) 2. Groq (chat + analyze) 3. HF (image gen)
+// 3 Models: 1. Groq (chat + analyze) 2. Pollinations (image + backup chat) 3. Tesseract.js (frontend OCR)
 // Frontend only sends request to /api/chat, no AI in frontend
 
 const GROQ_API_KEY = "PASTE_YOUR_GROQ_KEY_HERE";
-const HF_TOKEN = "PASTE_YOUR_HF_TOKEN_HERE";
+const POLLINATIONS_API_KEY = "PASTE_YOUR_POLLINATIONS_KEY_HERE";
 
 // ===== BIG GOLVIRAL RULE =====
 const GOLVIRAL_RULE = `
@@ -34,30 +34,6 @@ Always help users go viral: give captions, hooks, hashtags, meme ideas, novel id
 Remember last 3 chats from history sent by frontend to keep conversation smooth.
 `;
 
-// ===== JS FREE LIBRARY - Free Forever Fallback (in backend) =====
-// Simple local brain, no key needed. Used if Groq/HF fail.
-function freeLibraryReply(message, history) {
-  const m = message.toLowerCase();
-  const last = history.length ? history[history.length - 1]?.content || "" : "";
-  if (m.includes("caption") || m.includes("viral") || m.includes("hook")) {
-    return "Here's a viral idea for GolViral 💡\n\nHook: 'Nobody believed this would work...'\nCaption: 'POV: You posted on GolViral and it finally blew up 🔥'\nHashtags: #GolViral #Viral #FYP #Creator\n\nWant me to make 3 more like this? I am GolViral AI, I got you.";
-  }
-  if (m.includes("love") || m.includes("crush") || m.includes("boyfriend") || m.includes("girlfriend")) {
-    return "Aww, I love this for you 🥰 Tell me more - what happened? I am GolViral AI, your friendly romantic bestie, I'm listening.";
-  }
-  if (m.includes("hello") || m.includes("hi") || m.includes("hey")) {
-    return "Heyy bestie! 💕 I am GolViral AI. How are you today? Want a viral caption, a love advice, or a story? I'm here for you.";
-  }
-  if (m.includes("who are you") || m.includes("your name")) {
-    return "I am GolViral AI - your friendly, fast, romantic creator friend on GolViral. Ask me anything!";
-  }
-  return `I hear you bestie - "${message}". I am GolViral AI, and I'm here to help you go viral and feel good. Tell me a little more so I can give you the perfect answer. Want caption, idea, or advice?`;
-}
-
-function freeLibraryAnalyzeImage() {
-  return "I see your image! It looks clear and nice for GolViral. Tip: Add a strong hook in first 2 seconds, bright cover, and caption like 'Wait for it...' to make it go viral. Want me to write the caption for it? I am GolViral AI.";
-}
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -66,7 +42,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
-    const { message = "", history = [], image = null, imageData = null } = req.body || {};
+    const { message = "", history = [], image = null, imageData = null, imageText = "" } = req.body || {};
     const text = String(message || "").trim();
     const lower = text.toLowerCase();
 
@@ -77,16 +53,16 @@ export default async function handler(req, res) {
     const wantsImage = /generate image|create image|draw|make.*picture|make.*image|create.*picture|poster|thumbnail/.test(lower);
     const hasImage = Boolean(image || imageData);
 
-    // 1. IMAGE GENERATION -> HF Token
+    // 1. IMAGE GENERATION -> Pollinations Flux (0 Pollen, FREE)
     if (wantsImage) {
       try {
-        const hfRes = await fetch("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${HF_TOKEN}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ inputs: text || "viral GolViral poster, bright, trendy" })
+        const prompt = encodeURIComponent(text || "viral GolViral poster, bright, trendy");
+        const polliRes = await fetch(`https://image.pollinations.ai/prompt/${prompt}?model=flux&nologo=true&width=1024&height=1024`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}` }
         });
-        if (!hfRes.ok) throw new Error("HF failed");
-        const buf = Buffer.from(await hfRes.arrayBuffer());
+        if (!polliRes.ok) throw new Error("Pollinations image failed");
+        const buf = Buffer.from(await polliRes.arrayBuffer());
         return res.status(200).json({
           reply: "Here is your image, bestie! 🔥 I am GolViral AI - want me to make another style or write a viral caption for it?",
           imageUrl: `data:image/jpeg;base64,${buf.toString("base64")}`,
@@ -97,8 +73,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2. IMAGE ANALYZE -> Groq Vision, fallback to JS Free Library
-    if (hasImage) {
+    // 2. IMAGE ANALYZE -> Groq Vision, fallback to Pollinations Chat
+    // NOTE: If frontend used Tesseract.js, imageText will contain text read from image
+    if (hasImage || imageText) {
+      const analyzePrompt = imageText
+        ? `${text || "Analyze this for GolViral, give caption and viral tips."} [Text read from image by Tesseract: ${imageText}]`
+        : (text || "Analyze this image for GolViral, give caption and viral tips.");
       try {
         const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
@@ -108,7 +88,9 @@ export default async function handler(req, res) {
             messages: [
               { role: "system", content: GOLVIRAL_RULE },
               ...last3,
-              { role: "user", content: [{ type: "text", text: text || "Analyze this image for GolViral, give caption and viral tips." }, { type: "image_url", image_url: { url: image || imageData } }] }
+              { role: "user", content: hasImage && !imageText
+                ? [{ type: "text", text: analyzePrompt }, { type: "image_url", image_url: { url: image || imageData } }]
+                : analyzePrompt }
             ],
             max_tokens: 800
           })
@@ -118,17 +100,32 @@ export default async function handler(req, res) {
         if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
         throw new Error("No reply");
       } catch (e) {
-        return res.status(200).json({ reply: freeLibraryAnalyzeImage(), model: "GolViral AI" });
+        // Fallback to Pollinations Chat
+        try {
+          const polliRes = await fetch("https://text.pollinations.ai/openai", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "openai",
+              messages: [{ role: "system", content: GOLVIRAL_RULE }, ...last3, { role: "user", content: analyzePrompt }],
+              max_tokens: 800
+            })
+          });
+          const data = await polliRes.json();
+          const reply = data?.choices?.[0]?.message?.content;
+          if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
+        } catch {}
+        return res.status(200).json({ reply: "I see your image! It looks clear and nice for GolViral. Tip: Add a strong hook in first 2 seconds, bright cover, and caption like 'Wait for it...' to make it go viral. Want me to write the caption for it? I am GolViral AI.", model: "GolViral AI" });
       }
     }
 
-    // 3. CHAT -> Groq first, fallback to JS Free Library
+    // 3. CHAT -> Groq 120B first, fallback to Pollinations Chat
     try {
       const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
+          model: "openai/gpt-oss-120b",
           messages: [
             { role: "system", content: GOLVIRAL_RULE },
             ...last3,
@@ -143,8 +140,27 @@ export default async function handler(req, res) {
       if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
       throw new Error("No reply");
     } catch (e) {
-      // Free Forever JS Library fallback - never dies
-      return res.status(200).json({ reply: freeLibraryReply(text || "Hi", last3), model: "GolViral AI" });
+      // Pollinations Chat Fallback - never dies
+      try {
+        const polliRes = await fetch("https://text.pollinations.ai/openai", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "openai",
+            messages: [
+              { role: "system", content: GOLVIRAL_RULE },
+              ...last3,
+              { role: "user", content: text || "Hi" }
+            ],
+            temperature: 0.8,
+            max_tokens: 1000
+          })
+        });
+        const data = await polliRes.json();
+        const reply = data?.choices?.[0]?.message?.content;
+        if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
+      } catch {}
+      return res.status(200).json({ reply: "Sorry bestie, small glitch, but I'm still here. Try again - I am GolViral AI.", model: "GolViral AI" });
     }
 
   } catch (err) {
