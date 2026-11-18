@@ -2,8 +2,8 @@
 // 3 Models: 1. Groq (chat + analyze) 2. Pollinations (image + backup chat) 3. Tesseract.js (frontend OCR)
 // Frontend only sends request to /api/chat, no AI in frontend
 
-const GROQ_API_KEY = "PASTE_YOUR_GROQ_KEY_HERE";
-const POLLINATIONS_API_KEY = "PASTE_YOUR_POLLINATIONS_KEY_HERE";
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
 
 // ===== BIG GOLVIRAL RULE =====
 const GOLVIRAL_RULE = `
@@ -34,6 +34,72 @@ Always help users go viral: give captions, hooks, hashtags, meme ideas, novel id
 Remember last 3 chats from history sent by frontend to keep conversation smooth.
 `;
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function fetchTimeout(url, options = {}, timeoutMs = 25000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    return res;
+  } finally { clearTimeout(timer); }
+}
+
+// Retry helper: tries fn() up to `attempts` times, waits longer each time
+async function retry(fn, attempts, baseDelay = 1200) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const out = await fn();
+      if (out) return out;
+      throw new Error("Empty reply");
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await sleep(baseDelay * (i + 1));
+    }
+  }
+  throw lastErr || new Error("All retries failed");
+}
+
+async function groqChat(messages, max_tokens) {
+  const res = await fetchTimeout("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "openai/gpt-oss-120b", messages, temperature: 0.8, max_tokens })
+  }, 25000);
+  if (!res.ok) throw new Error("Groq " + res.status);
+  const data = await res.json();
+  const reply = data?.choices?.[0]?.message?.content;
+  if (!reply) throw new Error("Groq empty");
+  return reply;
+}
+
+async function groqVision(messages, max_tokens) {
+  const res = await fetchTimeout("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "meta-llama/llama-4-scout-17b-16e-instruct", messages, max_tokens })
+  }, 25000);
+  if (!res.ok) throw new Error("Groq Vision " + res.status);
+  const data = await res.json();
+  const reply = data?.choices?.[0]?.message?.content;
+  if (!reply) throw new Error("Groq Vision empty");
+  return reply;
+}
+
+async function pollinationsChat(messages, max_tokens) {
+  const res = await fetchTimeout("https://text.pollinations.ai/openai", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "openai", messages, temperature: 0.8, max_tokens })
+  }, 25000);
+  if (!res.ok) throw new Error("Pollinations " + res.status);
+  const data = await res.json();
+  const reply = data?.choices?.[0]?.message?.content;
+  if (!reply) throw new Error("Pollinations empty");
+  return reply;
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -56,13 +122,17 @@ export default async function handler(req, res) {
     // 1. IMAGE GENERATION -> Pollinations Flux (0 Pollen, FREE)
     if (wantsImage) {
       try {
-        const prompt = encodeURIComponent(text || "viral GolViral poster, bright, trendy");
-        const polliRes = await fetch(`https://image.pollinations.ai/prompt/${prompt}?model=flux&nologo=true&width=1024&height=1024`, {
-          method: "GET",
-          headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}` }
-        });
-        if (!polliRes.ok) throw new Error("Pollinations image failed");
-        const buf = Buffer.from(await polliRes.arrayBuffer());
+        const buf = await retry(async () => {
+          const prompt = encodeURIComponent(text || "viral GolViral poster, bright, trendy");
+          const polliRes = await fetchTimeout(`https://image.pollinations.ai/prompt/${prompt}?model=flux&nologo=true&width=1024&height=1024`, {
+            method: "GET",
+            headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}` }
+          }, 30000);
+          if (!polliRes.ok) throw new Error("Pollinations image failed");
+          const b = Buffer.from(await polliRes.arrayBuffer());
+          if (!b.length) throw new Error("Empty image");
+          return b;
+        }, 3, 1500);
         return res.status(200).json({
           reply: "Here is your image, bestie! 🔥 I am GolViral AI - want me to make another style or write a viral caption for it?",
           imageUrl: `data:image/jpeg;base64,${buf.toString("base64")}`,
@@ -79,91 +149,50 @@ export default async function handler(req, res) {
       const analyzePrompt = imageText
         ? `${text || "Analyze this for GolViral, give caption and viral tips."} [Text read from image by Tesseract: ${imageText}]`
         : (text || "Analyze this image for GolViral, give caption and viral tips.");
+      // Try Groq Vision 2x, then Pollinations 2x
       try {
-        const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "meta-llama/llama-4-scout-17b-16e-instruct",
-            messages: [
-              { role: "system", content: GOLVIRAL_RULE },
-              ...last3,
-              { role: "user", content: hasImage && !imageText
-                ? [{ type: "text", text: analyzePrompt }, { type: "image_url", image_url: { url: image || imageData } }]
-                : analyzePrompt }
-            ],
-            max_tokens: 800
-          })
-        });
-        const data = await groqRes.json();
-        const reply = data?.choices?.[0]?.message?.content;
-        if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
-        throw new Error("No reply");
-      } catch (e) {
-        // Fallback to Pollinations Chat
-        try {
-          const polliRes = await fetch("https://text.pollinations.ai/openai", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: "openai",
-              messages: [{ role: "system", content: GOLVIRAL_RULE }, ...last3, { role: "user", content: analyzePrompt }],
-              max_tokens: 800
-            })
-          });
-          const data = await polliRes.json();
-          const reply = data?.choices?.[0]?.message?.content;
-          if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
-        } catch {}
-        return res.status(200).json({ reply: "I see your image! It looks clear and nice for GolViral. Tip: Add a strong hook in first 2 seconds, bright cover, and caption like 'Wait for it...' to make it go viral. Want me to write the caption for it? I am GolViral AI.", model: "GolViral AI" });
-      }
+        const reply = await retry(() => groqVision([
+          { role: "system", content: GOLVIRAL_RULE },
+          ...last3,
+          { role: "user", content: hasImage && !imageText
+            ? [{ type: "text", text: analyzePrompt }, { type: "image_url", image_url: { url: image || imageData } }]
+            : analyzePrompt }
+        ], 800), 2, 1200);
+        return res.status(200).json({ reply, model: "GolViral AI" });
+      } catch {}
+      try {
+        const reply = await retry(() => pollinationsChat([
+          { role: "system", content: GOLVIRAL_RULE }, ...last3, { role: "user", content: analyzePrompt }
+        ], 800), 2, 1200);
+        return res.status(200).json({ reply, model: "GolViral AI" });
+      } catch {}
+      return res.status(200).json({ reply: "I see your image! It looks clear and nice for GolViral. Tip: Add a strong hook in first 2 seconds, bright cover, and caption like 'Wait for it...' to make it go viral. Want me to write the caption for it? I am GolViral AI.", model: "GolViral AI" });
     }
 
     // 3. CHAT -> Groq 120B first, fallback to Pollinations Chat
+    // Groq 3 tries -> Pollinations 3 tries -> 503 so frontend HOLDS + RETRIES, never shows glitch as reply
     try {
-      const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "openai/gpt-oss-120b",
-          messages: [
-            { role: "system", content: GOLVIRAL_RULE },
-            ...last3,
-            { role: "user", content: text || "Hi" }
-          ],
-          temperature: 0.8,
-          max_tokens: 1000
-        })
-      });
-      const data = await groqRes.json();
-      const reply = data?.choices?.[0]?.message?.content;
-      if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
-      throw new Error("No reply");
+      const reply = await retry(() => groqChat([
+        { role: "system", content: GOLVIRAL_RULE },
+        ...last3,
+        { role: "user", content: text || "Hi" }
+      ], 1000), 3, 1200);
+      return res.status(200).json({ reply, model: "GolViral AI" });
+    } catch {}
+    try {
+      const reply = await retry(() => pollinationsChat([
+        { role: "system", content: GOLVIRAL_RULE },
+        ...last3,
+        { role: "user", content: text || "Hi" }
+      ], 1000), 3, 1200);
+      return res.status(200).json({ reply, model: "GolViral AI" });
     } catch (e) {
-      // Pollinations Chat Fallback - never dies
-      try {
-        const polliRes = await fetch("https://text.pollinations.ai/openai", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${POLLINATIONS_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "openai",
-            messages: [
-              { role: "system", content: GOLVIRAL_RULE },
-              ...last3,
-              { role: "user", content: text || "Hi" }
-            ],
-            temperature: 0.8,
-            max_tokens: 1000
-          })
-        });
-        const data = await polliRes.json();
-        const reply = data?.choices?.[0]?.message?.content;
-        if (reply) return res.status(200).json({ reply, model: "GolViral AI" });
-      } catch {}
-      return res.status(200).json({ reply: "Sorry bestie, small glitch, but I'm still here. Try again - I am GolViral AI.", model: "GolViral AI" });
+      // Both providers failed after retries - tell frontend to retry, DO NOT send glitch as 200 reply
+      return res.status(503).json({ error: "retry", message: "All providers busy, retry" });
     }
 
   } catch (err) {
-    return res.status(200).json({ reply: "Sorry bestie, small glitch, but I'm still here. Try again - I am GolViral AI.", model: "GolViral AI" });
+    // Top-level fail - also 503 so frontend holds + retries, never glitch bubble
+    return res.status(503).json({ error: "retry", message: "Server busy, retry" });
   }
 }
